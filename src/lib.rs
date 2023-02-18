@@ -1,8 +1,9 @@
 use std::{time::Duration, collections::HashMap};
 
-use aes_gcm::{KeyInit, Aes256Gcm, aead::Aead, AeadInPlace, Aes128Gcm, AesGcm, aes::Aes128};
+use aes_gcm::{KeyInit, aead::Aead, AeadInPlace, AesGcm, aes::Aes128};
 use futures_util::{StreamExt, stream::{SplitStream, SplitSink}, TryStreamExt, SinkExt};
 use rand::Rng;
+use serde_json::json;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message,
     WebSocketStream, MaybeTlsStream};
 use tokio::net::TcpStream;
@@ -16,10 +17,12 @@ use rsa::{RsaPrivateKey, Oaep, pkcs8::EncodePublicKey};
 use base64::{Engine as _, engine::{general_purpose}};
 use aes_gcm::aead::generic_array::GenericArray;
 
+mod mxc_types;
+
 // Logging stuff
 #[cfg(not(test))] 
 use log::{warn, debug}; // Use log crate when building application
- 
+
 #[cfg(test)]
 use std::{println as warn, println as debug}; // Workaround to use println! for logs.
 
@@ -147,7 +150,7 @@ impl NodeConnection {
                         Ok(msg) => {
                             Ok(msg)
                         }
-                        Err(x) => {
+                        Err(_) => {
                             Err("Failed to decrypt message")
                         }
                     }?;
@@ -245,8 +248,9 @@ impl Node {
         Ok(())
     }
 
-    /// Disconnect from node
+    /// Disconnect from node, returns Error if terminated ungracefully and thread may still be running
     pub async fn disconnect(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // Tell handler thread to terminate
         let to_return = match &self.connection {
             Some(x) => {
                 x.terminate().await
@@ -267,10 +271,12 @@ impl Node {
     }
 
     /// Send request to node
-    pub async fn request(&self, text: String) -> Result<String, Box<dyn std::error::Error>> {
+    pub async fn request(&self, json: serde_json::Value) -> Result<HashMap<String, serde_json::Value>, Box<dyn std::error::Error>> {
         match &self.connection {
             Some(x) => {
-                x.request(text).await
+                let request = serde_json::to_string(&json)?;
+                let response: HashMap<String, serde_json::Value> = serde_json::from_str(&x.request(request).await?)?;
+                Ok(response)
             },
             None => {
                 Err("Not connected to node")?
@@ -285,6 +291,279 @@ impl Node {
             address,
             handshake_key,
         }
+    }
+
+        /// Get a list of all accounts that have been opened and their balance
+    /// NOTE: This may take a while to complete if there are a lot of accounts
+    pub async fn get_accounts(&self) -> Result<Vec<mxc_types::AccountBalance>, Box<dyn std::error::Error>> {
+        let request = json!({
+            "type": "getAccounts",
+        });
+
+        let response = self.request(request).await?;
+        // Check if response is valid
+        match response.get("type") {
+            Some(x) => {
+                if x.to_string().replace('"', "").trim() != "getAccounts" {
+                    return Err("Error while getting accounts: Type mismatched".into());
+                }
+            }
+            None => {
+                return Err("Error while getting accounts: No field named `type` in response".into());
+            }
+        };
+
+        match response.get("accounts") {
+            Some(x) => {
+                debug!("Accounts: {}", x);
+                let accounts: &serde_json::Map<String, serde_json::Value> = x.as_object().ok_or("accounts field is not an object")?;
+                let mut account_balances: Vec<mxc_types::AccountBalance> = Vec::new();
+                for account in accounts {
+                    account_balances.push(mxc_types::AccountBalance {
+                        address: account.0.to_string().replace('"', "").trim().to_string(),
+                        balance: account.1.to_string().replace('"', "").trim().parse::<f64>()?,
+                    });
+                }
+
+                Ok(account_balances)
+            }
+            None => {
+                Err("No field named `accounts` in response".into())
+            }
+        }
+    }
+}
+
+
+/// Represents an mxc account that can be used in un-authenticated requests
+#[derive(Debug)]
+#[allow(dead_code)]
+struct Account {
+    address: String,
+    node: Node,
+}
+
+#[allow(dead_code)]
+impl Account {
+    /// Create new account instance, node is optional and will be created with default settings if not provided
+    async fn new(address: String, node: Option<Node>) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok (Self {
+            address,
+            node: match node {
+                Some(x) => {x},
+                None => {
+                    let mut node = Node::new("ws://murraxcoin.murraygrov.es:6969".to_string(), None).await;
+                    node.connect().await?;
+                    node
+                }
+            }
+        })
+    }
+
+    /// Get balance of the account
+    async fn balance(&self) -> Result<f64, Box<dyn std::error::Error>> {
+        // TODO - Handle empty accounts
+        let request = json!({
+            "type": "balance",
+            "address": &self.address,
+        });
+
+        let response = self.node.request(request).await?;
+        debug!("Response: {:?}", response);
+        match response.get("balance") {
+            Some(x) => {
+                Ok(x.to_string().replace('"', "").trim().parse::<f64>()?)
+            }
+            None => {
+                Err("No field named `balance` in response".into())
+            }
+        }
+    }
+
+    /// Check for a pending transaction
+    async fn pending_send(&self) -> Result<Option<mxc_types::PendingSend>, Box<dyn std::error::Error>> {
+        let request = json!({
+            "type": "pendingSend",
+            "address": &self.address,
+        });
+
+        let response = self.node.request(request).await?;
+        match response.get("link") {
+            Some(x) => {
+                if x.to_string().replace('"', "").trim() == "" {
+                    return Ok(None);
+                } else {
+                    return Ok(Some(mxc_types::PendingSend {
+                        link: x.to_string().replace('"', "").trim().to_string(),
+                        amount: response.get("sendAmount").unwrap().to_string().replace('"', "").trim().parse::<f64>()?,
+                    }));
+                }
+            }
+            None => {
+                // Even if no pending sends are available, there should be an empty field named `link` in the response
+                Err("Request errored out while checking for pending send".into())
+            }
+        }
+    }
+
+    /// Return ID of the last transaction from this account
+    async fn get_previous(&self) -> Result<String, Box<dyn std::error::Error>> {
+        let request = json!({
+            "type": "getPrevious",
+            "address": &self.address,
+        });
+
+        let response = self.node.request(request).await?;
+
+        // Check if response is valid
+        match response.get("type") {
+            Some(x) => {
+                if x.to_string().replace('"', "").trim() != "previous" {
+                    return Err("Error while getting previous: Type mismatched".into());
+                }
+            }
+            None => {
+                return Err("Error while getting previous: No field named `type` in response".into());
+            }
+        };
+
+        match response.get("link") {
+            Some(x) => {
+                if response.get("address").ok_or("no field address")?.to_string().replace('"', "").trim() != self.address {
+                    return Err("Error while getting previous: Address mismatched".into());
+                };
+
+                Ok(
+                    x.to_string().replace('"', "").trim().to_string()
+                )
+            }
+            None => {
+                Err("No field named `link` in response".into())
+            }
+        }
+    }
+
+    /// Get this account's representative
+    async fn get_representative(&self) -> Result<String, Box<dyn std::error::Error>> {
+        let request = json!({
+            "type": "getRepresentative",
+            "address": &self.address,
+        });
+
+        let response = self.node.request(request).await?;
+        // Check if response is valid
+        match response.get("type") {
+            Some(x) => {
+                if x.to_string().replace('"', "").trim() != "info" {
+                    return Err("Error while getting representative: Type mismatched".into());
+                }
+            }
+            None => {
+                return Err("Error while getting representative: No field named `type` in response".into());
+            }
+        };
+
+        match response.get("representative") {
+            Some(x) => {
+                Ok(x.to_string().replace('"', "").trim().to_string())
+            }
+            None => {
+                Err("No field named `representative` in response".into())
+            }
+        }
+    }
+
+    /// Get a block belonging to this account with specified ID
+    async fn get_block(&self, id: String) -> Result<mxc_types::Block, Box<dyn std::error::Error>> {
+        let request = json!({
+            "type": "getBlock",
+            "address": &self.address,
+            "block": &id,
+        });
+
+        let response = self.node.request(request).await?;
+        // Check if response is valid
+        match response.get("type") {
+            Some(x) => {
+                if x.to_string().replace('"', "").trim() != "getBlock" {
+                    return Err("Error while getting block: Type mismatched".into());
+                }
+            }
+            None => {
+                return Err("Error while getting block: No field named `type` in response".into());
+            }
+        };
+
+        match response.get("block") {
+            Some(x) => {
+                let block = x.to_string();
+                let block = mxc_types::Block::from_str(&block)?;
+                Ok(block)
+            }
+            None => {
+                Err("No field named `block` in response".into())
+            }
+        }
+    }
+
+    /// Get the most recent block belonging to this account
+    async fn get_head(&self) -> Result<mxc_types::Block, Box<dyn std::error::Error>> {
+        let request = json!({
+            "type": "getHead",
+            "address": &self.address,
+        });
+
+        let response = self.node.request(request).await?;
+        // Check if response is valid
+        match response.get("type") {
+            Some(x) => {
+                if x.to_string().replace('"', "").trim() != "getHead" {
+                    return Err("Error while getting head: Type mismatched".into());
+                }
+            }
+            None => {
+                return Err("Error while getting head: No field named `type` in response".into());
+            }
+        };
+
+        match response.get("block") {
+            Some(x) => {
+                let block = x.to_string();
+                let block = mxc_types::Block::from_str(&block)?;
+                Ok(block)
+            }
+            None => {
+                Err("No field named `block` in response".into())
+            }
+        }
+    }
+}
+
+/// Represents an mxc account that can be used in authenticated requests (transactions)
+#[derive(Debug)]
+#[allow(dead_code)]
+struct AuthenticatedAccount {
+    pub address: String,
+    account: Account,
+    keypair: ed25519_dalek::Keypair,
+}
+
+#[allow(dead_code)]
+impl AuthenticatedAccount {
+    /// Create new authenticated account instance, node is optional and will be created with default settings if not provided
+    async fn new(keypair: ed25519_dalek::Keypair, node: Option<Node>) -> Result<Self, Box<dyn std::error::Error>> {
+        let public_key = keypair.public.to_bytes();
+        let slice = &public_key[..];
+        let checksum = adler32::adler32(slice)?;
+        let checksum = checksum.to_be_bytes();
+        let checksum = base32::encode(base32::Alphabet::RFC4648 { padding: false }, &checksum);
+        let address = base32::encode(base32::Alphabet::RFC4648 { padding: false }, &public_key);
+        let address = format!("mxc_{}{}", address, checksum).to_lowercase();
+        Ok (Self {
+            address: address.clone(),
+            account: Account::new(address, node).await?,
+            keypair,
+        })
     }
 }
 
@@ -314,5 +593,82 @@ mod tests {
         let connection = NodeConnection::new(NODE_ADDRESS.to_string(), None).await.unwrap();
         let response = connection.request("{\"type\": \"ping\"}".to_string()).await.unwrap();
         assert_eq!(response, "{\"type\": \"confirm\", \"action\": \"ping\"}");
+    }
+
+    // Check if address is generated properly
+    #[tokio::test]
+    async fn check_address() {
+        // Don't worry, these are testing keys!
+        let keys = [189, 135, 96, 146, 26, 200, 148, 57, 163, 9, 22, 245, 156, 134, 68, 70, 62, 41, 241, 175, 118, 81, 167, 50, 162, 77, 38, 33, 60, 20, 190, 210, 159, 8, 255, 78, 136, 102, 194, 145, 196, 157, 0, 188, 9, 125, 184, 21, 159, 138, 114, 244, 248, 108, 5, 214, 37, 179, 244, 163, 104, 83, 124, 200];
+        let keypair = ed25519_dalek::Keypair::from_bytes(&keys).unwrap();
+
+        let account = AuthenticatedAccount::new(keypair, None).await.unwrap();
+        assert_eq!(account.address, "mxc_t4ep6tuim3bjdre5ac6as7nycwpyu4xu7bwalvrfwp2kg2ctpteab5sbbyq");
+    }
+
+    // Check if json requests work
+    #[tokio::test]
+    async fn check_json() {
+        let mut node = Node::new(NODE_ADDRESS.to_string(), None).await;
+        node.connect().await.unwrap();
+        let response = node.request(json!({"type": "ping"})).await.unwrap();
+        assert_eq!(response.get("type").unwrap(), "confirm");
+    }
+
+    // Check if balance works
+    #[tokio::test]
+    async fn balance() {
+        // Address with one open transaction with a balance of 1
+        let address = "mxc_chjd6tbiokxpwucsbvhlfxe6paul5nnfik5ugotlrieepcqlve4a5iuq3ry";
+        let account = Account::new(address.to_string(), None).await.unwrap();
+        let balance = account.balance().await.unwrap();
+        assert!(balance == 1.0)
+    }
+
+    // Check if get previous works
+    #[tokio::test]
+    async fn previous() {
+        // Address with one transaction with id 7a2ea6be0881d9e591568dac52f1344b24ffc7d33ef4e1e9069edc78f158c3f8c94bfed463cf032057f6a36f83af22ba4f5f33f84718b0ac9d10184b83899f12
+        let address = "mxc_chjd6tbiokxpwucsbvhlfxe6paul5nnfik5ugotlrieepcqlve4a5iuq3ry";
+        let account = Account::new(address.to_string(), None).await.unwrap();
+        let previous = account.get_previous().await.unwrap();
+        assert_eq!(previous, "7a2ea6be0881d9e591568dac52f1344b24ffc7d33ef4e1e9069edc78f158c3f8c94bfed463cf032057f6a36f83af22ba4f5f33f84718b0ac9d10184b83899f12")
+    }
+
+    // Check if get representative works
+    #[tokio::test]
+    async fn representative() {
+        // Address with representative as itself
+        let address = "mxc_chjd6tbiokxpwucsbvhlfxe6paul5nnfik5ugotlrieepcqlve4a5iuq3ry";
+        let account = Account::new(address.to_string(), None).await.unwrap();
+        let rep = account.get_representative().await.unwrap();
+        assert_eq!(rep, "mxc_chjd6tbiokxpwucsbvhlfxe6paul5nnfik5ugotlrieepcqlve4a5iuq3ry")
+    }
+
+    /// Check if `getAccounts` returns some accounts
+    #[tokio::test]
+    async fn get_accounts() {
+        let mut node = Node::new(NODE_ADDRESS.to_string(), None).await;
+        node.connect().await.unwrap();
+        let accounts = node.get_accounts().await.unwrap();
+        assert!(accounts.len() > 5);
+    }
+
+    #[tokio::test]
+    async fn get_block() {
+        let address = "mxc_chjd6tbiokxpwucsbvhlfxe6paul5nnfik5ugotlrieepcqlve4a5iuq3ry";
+        let account = Account::new(address.to_string(), None).await.unwrap();
+        let block = account.get_block("7a2ea6be0881d9e591568dac52f1344b24ffc7d33ef4e1e9069edc78f158c3f8c94bfed463cf032057f6a36f83af22ba4f5f33f84718b0ac9d10184b83899f12".to_string()).await.unwrap();
+        let desired_block = mxc_types::Block::from_str(r#"{"type": "open", "previous": "00000000000000000000", "address": "mxc_chjd6tbiokxpwucsbvhlfxe6paul5nnfik5ugotlrieepcqlve4a5iuq3ry", "link": "mxc_f33eh3iqczypaxn7klhwqzpg4ssxx4wjirq4lmwfydvpvsjey6tae72bg2i/143d40f87c3e2c4c204d5d760870144b76a21fb8b7051c7f7b100c078f1de2363019d9b6398405b6e5d19c5530d32bef54575952e6176d372361a378a148b0f2", "balance": 1.0, "representative": "mxc_chjd6tbiokxpwucsbvhlfxe6paul5nnfik5ugotlrieepcqlve4a5iuq3ry", "id": "7a2ea6be0881d9e591568dac52f1344b24ffc7d33ef4e1e9069edc78f158c3f8c94bfed463cf032057f6a36f83af22ba4f5f33f84718b0ac9d10184b83899f12", "signature": "0xf611565ace11e29e098c18a646b0adae4d4c5beb38dff1acd9456d08c4c199a2a94734ec8493ac825fc423999a4f77a918448dfb5b46ce2e7457685fb1aec7a"}"#).unwrap();
+        assert_eq!(block, desired_block)
+    }
+
+    #[tokio::test]
+    async fn get_head() {
+        let address = "mxc_chjd6tbiokxpwucsbvhlfxe6paul5nnfik5ugotlrieepcqlve4a5iuq3ry";
+        let account = Account::new(address.to_string(), None).await.unwrap();
+        let block = account.get_head().await.unwrap();
+        let desired_block = mxc_types::Block::from_str(r#"{"type": "open", "previous": "00000000000000000000", "address": "mxc_chjd6tbiokxpwucsbvhlfxe6paul5nnfik5ugotlrieepcqlve4a5iuq3ry", "link": "mxc_f33eh3iqczypaxn7klhwqzpg4ssxx4wjirq4lmwfydvpvsjey6tae72bg2i/143d40f87c3e2c4c204d5d760870144b76a21fb8b7051c7f7b100c078f1de2363019d9b6398405b6e5d19c5530d32bef54575952e6176d372361a378a148b0f2", "balance": 1.0, "representative": "mxc_chjd6tbiokxpwucsbvhlfxe6paul5nnfik5ugotlrieepcqlve4a5iuq3ry", "id": "7a2ea6be0881d9e591568dac52f1344b24ffc7d33ef4e1e9069edc78f158c3f8c94bfed463cf032057f6a36f83af22ba4f5f33f84718b0ac9d10184b83899f12", "signature": "0xf611565ace11e29e098c18a646b0adae4d4c5beb38dff1acd9456d08c4c199a2a94734ec8493ac825fc423999a4f77a918448dfb5b46ce2e7457685fb1aec7a"}"#).unwrap();
+        assert_eq!(block, desired_block)
     }
 }
